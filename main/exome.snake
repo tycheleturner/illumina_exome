@@ -1,0 +1,189 @@
+#Targeted seq pipeline
+#Tychele Turner, Ph.D.
+#01/20/2017
+
+import os
+
+if config == {}:
+    configfile: "config.json"
+
+DATA_DIR=config["data_dir"]
+FINAL_DIR=config["final_dir"]
+BWA=config["bwa"]
+JAVA=config["java"]
+PICARD=config["picard"]
+REFERENCE=config["reference"]
+GATK=config["gatk"]
+DBSNP=config["dbsnp"]
+HAPMAP=config["hapmap"]
+OMNI=config["omni"]
+KG=config["kg"]
+MILLS=config["mills"]
+KGINDEL=config["kgindel"]
+FREEBAYES=config["freebayes"]
+PLATYPUS=config["platypus"]
+
+SAMPLES = []
+for file in os.listdir(DATA_DIR):
+	SAMPLES.append(str(file))
+
+print(SAMPLES)
+
+rule all:
+        input: expand("%s/{sample}/s_1_1_sequence.txt"%DATA_DIR, sample = SAMPLES), expand("%s/{sample}/s_1_2_sequence.txt"%DATA_DIR, sample = SAMPLES), expand("{sample}.bam", sample = SAMPLES), expand("{sample}.sam", sample = SAMPLES), expand("{sample}.aln.bam", sample = SAMPLES), expand("{sample}.aln.markdups.bam", sample = SAMPLES), expand("{sample}.dedup.metrics", sample = SAMPLES), expand("{sample}.forRealigner.intervals", sample = SAMPLES), expand("{sample}.aln.markdups.realign.bam", sample = SAMPLES), expand("{sample}.recal.grp", sample = SAMPLES), expand("{sample}.final.bam", sample=SAMPLES), expand("{sample}.recal.grp", sample = SAMPLES), expand("{sample}.haplotypeCalls.raw.vcf", sample=SAMPLES), expand("{sample}.sample_interval_statistics", sample=SAMPLES), expand("{sample}.sample_interval_summary", sample=SAMPLES), expand("{sample}.sample_statistics", sample=SAMPLES), expand("{sample}.sample_summary", sample=SAMPLES), expand("{sample}.freebayes.vcf", sample=SAMPLES), expand("{sample}.platypus.vcf", sample=SAMPLES), expand("{sample}.samtools.mpileup", sample=SAMPLES), expand("{sample}.samtools.vcf", sample=SAMPLES), expand("{sample}.final.sort.bam", sample=SAMPLES), expand("{sample}.final.sort.bam.bai", sample=SAMPLES)
+		params: sge_opts="-l mfree=20G -N run_all" 
+
+rule index_bam:
+        input: "{sample}.final.sort.bam"
+        output: "{sample}.final.sort.bam.bai"
+        params: prefix="{sample}.final.sort.bam", sge_opts="-l h_vmem=6G -cwd "
+        shell: """
+        module load samtools/1.3
+        samtools index {input} 
+        """
+
+rule sort_bam:
+        input: "{sample}.final.bam"
+        output: "{sample}.final.sort.bam"
+        params: prefix="{sample}.final.sort", sge_opts="-l h_vmem=6G -cwd "
+        shell: """
+        module load samtools/1.3
+        samtools sort {input} {params.prefix}
+	"""
+
+rule samtools:
+        input: "{sample}.final.bam"
+        output: "{sample}.samtools.mpileup", "{sample}.samtools.vcf"
+        params: prefix="{sample}.samtools", sge_opts="-l h_vmem=6G -cwd "
+        shell: """
+        module load samtools/1.3
+	samtools mpileup -E -uf {REFERENCE} {input} > {params.prefix}.mpileup
+	bcftools view -cg {params.prefix}.mpileup > {params.prefix}.vcf
+        """
+rule platypus:
+        input: "{sample}.final.bam"
+        output: "{sample}.platypus.vcf"
+        params: sge_opts="-l h_vmem=6G -pe serial 6 -cwd "
+        shell: """
+        module load python/2.7.2
+	python {PLATYPUS} callVariants -o {output} --refFile {REFERENCE} --bamFiles {input} --minReads 5 --nCPU 6 --genIndels 1 --minMapQual 20 --minBaseQual 20 --filterDuplicates 1 --genSNPs 0 --maxReads 10000000
+        """
+
+rule freebayes:
+	input: "{sample}.final.bam"
+	output: "{sample}.freebayes.vcf"
+	params: sge_opts="-l h_vmem=6G -cwd "
+	shell: """
+	{FREEBAYES} -f {REFERENCE} -C 5 -m 20 -q 20 --min-coverage 10 {input} > {output} 
+	"""
+
+rule get_read_depth:
+        input: "{sample}.final.bam"
+	output: "{sample}.sample_interval_statistics", "{sample}.sample_interval_summary", "{sample}.sample_statistics", "{sample}.sample_summary"
+        params: prefix="{sample}", sge_opts="-l h_vmem=6G -cwd "
+        shell: """
+	{JAVA} -Xmx10G -jar {GATK} -T DepthOfCoverage -I {input} -R {REFERENCE} -dt BY_SAMPLE -dcov 5000 -l INFO --omitDepthOutputAtEachBase --omitLocusTable --minBaseQuality 0 --minMappingQuality 20 --start 1 --stop 5000 --nBins 200 --includeRefNSites --countType COUNT_FRAGMENTS -o {params.prefix}
+        """
+
+rule gatk_haplotype_caller:
+        input: "{sample}.final.bam"
+        output: "{sample}.haplotypeCalls.raw.vcf"
+        params: sge_opts="-l h_vmem=6G -pe serial 6 -cwd "
+        shell: """
+        {JAVA} -Xmx24g -jar {GATK} -T HaplotypeCaller --genotyping_mode DISCOVERY -A AlleleBalanceBySample -A DepthPerAlleleBySample -A MappingQualityZeroBySample -A StrandBiasBySample -A Coverage -A FisherStrand -A HaplotypeScore -A MappingQualityRankSumTest -A MappingQualityZero -A QualByDepth -A RMSMappingQuality -A ReadPosRankSumTest -A VariantType -l INFO --emitRefConfidence GVCF -rf BadCigar --variant_index_parameter 128000 --variant_index_type LINEAR -R {REFERENCE} -nct 6 -I {input} -o {output}
+        """
+
+rule print_bqsr_reads:
+        input: "{sample}.aln.markdups.realign.bam", "{sample}.recal.grp"
+        output: "{sample}.final.bam"
+        params: sge_opts="-l h_vmem=6G -pe serial 6 -cwd "
+        shell: """
+        {JAVA} -Xmx24g -jar {GATK} -T PrintReads -nct 6 -R {REFERENCE} -I {input[0]} -o {output} -BQSR {input[1]}
+        """
+rule gatk_base_recalibrator:
+        input: "{sample}.aln.markdups.realign.bam"
+        output: "{sample}.recal.grp"
+        params: sge_opts="-l h_vmem=6G -pe serial 4 -cwd "
+        shell: """
+        {JAVA} -Xmx24g -jar {GATK} -T BaseRecalibrator --interval_padding 200 --downsample_to_fraction 0.1 -rf BadCigar -nct 4 -R {REFERENCE} -I {input} -o {output} -knownSites {KG} -knownSites {HAPMAP} -knownSites {OMNI} -knownSites {DBSNP} -knownSites {MILLS} -knownSites {KGINDEL}
+        """
+
+rule indel_realigner:
+        input: "{sample}.aln.markdups.bam", "{sample}.forRealigner.intervals"
+        output: "{sample}.aln.markdups.realign.bam"
+        params: sge_opts="-l h_vmem=6G -cwd "
+        shell: """
+        {JAVA} -Xmx24g -jar {GATK} -T IndelRealigner -dcov 1000 --consensusDeterminationModel USE_READS -compress 0 -rf BadCigar -fixMisencodedQuals -R {REFERENCE} -targetIntervals {input[1]} -I {input[0]} -o {output}
+        """
+rule realigner_target_creator:
+        input: "{sample}.aln.markdups.bam"
+        output: "{sample}.forRealigner.intervals"
+        params: sge_opts="-l h_vmem=6G -pe serial 6 -cwd "
+        shell: """
+        {JAVA} -Xmx24g -jar {GATK} -T RealignerTargetCreator --interval_padding 200 -rf BadCigar -nt 24 -R {REFERENCE} -fixMisencodedQuals -I {input} -o {output}
+        """
+rule mark_duplicates:
+        input: "{sample}.aln.bam"        
+	output: "{sample}.aln.markdups.bam", "{sample}.dedup.metrics"
+        params: sge_opts="-l h_vmem=6G -cwd "
+        shell: """
+        {JAVA} -Xmx24g -jar {PICARD}MarkDuplicates.jar CREATE_INDEX=true MAX_RECORDS_IN_RAM=2000000 VALIDATION_STRINGENCY=SILENT M={output[1]} I={input} O={output[0]}
+        """
+rule add_read_groups:
+        input: "{sample}.bam"
+        output: "{sample}.aln.bam"
+        params: prefix="{sample}", sge_opts="-l h_vmem=6G -cwd "
+        shell: """
+        {JAVA} -Xmx24g -jar {PICARD}AddOrReplaceReadGroups.jar MAX_RECORDS_IN_RAM=2000000 CREATE_INDEX=true SORT_ORDER=coordinate VALIDATION_STRINGENCY=SILENT I={input} O={output} RGID={params.prefix} RGLB={params.prefix} RGSM={params.prefix} RGPU="HiSeq-2000" RGCN="MachineName" RGDS="hg37" RGPL="illumina"
+        """
+
+rule map_reads:
+        input: "%s/{sample}/s_1_1_sequence.txt"%DATA_DIR, "%s/{sample}/s_1_2_sequence.txt"%DATA_DIR
+        output: "{sample}.sam", "{sample}.bam"
+        params: sge_opts="-l h_vmem=6G -pe serial 6 -cwd "
+        shell: """
+	module load samtools/1.3
+        {BWA} mem -M -t 6 {REFERENCE} {input[0]} {input[1]} > {output[0]}
+        samtools view -Shb {output[0]} -o {output[1]}
+        """
+
+rule clean:
+	"""clean up temporary files"""
+	shell: """
+	rm *.aln.bai
+	rm *.aln.bam 
+	rm *.aln.markdups.bai
+	rm *.aln.markdups.bam
+	rm *.aln.markdups.realign.bai
+	rm *.aln.markdups.realign.bam
+	rm *.dedup.metrics
+	rm *final.bai
+	rm *final.bam
+	rm *.forRealigner.intervals	
+	rm *recal.grp
+	rm *sam
+	rm *pileup
+
+	mkdir {FINAL_DIR}freebayes
+	mkdir {FINAL_DIR}gatk
+	mkdir {FINAL_DIR}platypus
+	mkdir {FINAL_DIR}depth
+	mkdir {FINAL_DIR}samtools
+
+	mv *.haplotypeCalls.raw.vcf* {FINAL_DIR}gatk
+	mv *.freebayes.vcf {FINAL_DIR}freebayes
+	mv *.platypus.vcf {FINAL_DIR}platypus
+	mv *.vcf {FINAL_DIR}samtools
+	mv *.sample_* {FINAL_DIR}depth
+	
+	mkdir {FINAL_DIR}final_bams
+	mv *.final.sort.bam {FINAL_DIR}final_bams
+	mv *.final.sort.bam.bai {FINAL_DIR}final_bams
+
+	rm *bam
+	mv log.txt log/
+	tar -jcvf log.tar.bz2 log/
+	rm nohup.out
+	rm -rf log/
+	"""
+
